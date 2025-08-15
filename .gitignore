@@ -1,3 +1,6 @@
 # Ignorando arquivos de data
 
 /data/
+
+/TCC_VENV/
+__pycache__/
