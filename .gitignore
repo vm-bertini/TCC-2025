@@ -2,5 +2,5 @@
 
 /data/
 .env
-/TCC_VENV/
+tfc_venv/
 __pycache__/
