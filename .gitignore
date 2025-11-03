@@ -1,6 +1,7 @@
 # Ignorando arquivos de data
 
 /data/
+/modelos/
 .env
 /tfc_venv/
 __pycache__/
