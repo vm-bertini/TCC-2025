@@ -634,15 +634,29 @@ class LSTMPreprocessor(Preprocessor):
             print("[WARN] Nenhuma janela gerada.")
             return {}
 
-        X = np.stack(X_list)  # (N, seq_len, x_dim)
-        Y = np.stack(Y_list)  # (N, lead, y_dim)
+        X = np.stack(X_list)
+        Y = np.stack(Y_list)
         print(f"[JANELAS] X={X.shape}, Y={Y.shape}, seq_len={seq_len}, lead={lead}")
 
-        X_flat = X.reshape((X.shape[0], -1))
-        Y_flat = Y.reshape((Y.shape[0], -1))
+        # === NEW: Capture country IDs ===
+        country_ids = []
+        if "country" in df.columns:
+            for _, g in df.groupby("_group_id", sort=False):
+                if len(g) < seq_len + lead:
+                    continue
+                cid = g["country"].iloc[0]
+                n_win = len(g) - seq_len - lead + 1
+                country_ids.extend([cid] * n_win)
+        else:
+            country_ids = [0] * len(X)
+
+        country_ids = np.array(country_ids, dtype=np.int32)
+
+        # === Store full window representation ===
         self._seq_data = pd.DataFrame({
-            "X": [x for x in X_flat],
-            "Y": [y for y in Y_flat]
+            "X": [x.flatten() for x in X],
+            "Y": [y.flatten() for y in Y],
+            "country_id": country_ids,
         })
         self.feature_cols = feats
         self.target_cols = tgts
@@ -690,8 +704,10 @@ class LSTMPreprocessor(Preprocessor):
         out = {}
 
         for split_name, df in self.splits.items():
-            if not {"X", "Y"}.issubset(df.columns):
-                raise ValueError(f"O DataFrame '{split_name}' precisa conter colunas 'X' e 'Y'.")
+            required = {"X", "Y", "country_id"}
+            missing = required - set(df.columns)
+            if missing:
+                raise ValueError(f"Faltando colunas {missing} no DataFrame '{split_name}'.")
 
             pq_path = os.path.join(self.data_dir, f"{basename}_{split_name}.parquet")
 
@@ -739,9 +755,16 @@ class LSTMPreprocessor(Preprocessor):
         # Converte listas -> numpy e reshape por janela
         X_list = df["X"].to_list()
         Y_list = df["Y"].to_list()
+        country_ids = df["country_id"].to_numpy(dtype=np.int32).reshape(-1, 1)
+
         X = np.asarray(X_list, dtype=np.float32).reshape((-1, seq_len, x_dim))
         Y = np.asarray(Y_list, dtype=np.float32).reshape((-1, lead, y_dim))
-        ds = tf.data.Dataset.from_tensor_slices((X, Y))
+
+        ds = tf.data.Dataset.from_tensor_slices((
+            {"num_feats": X, "country_id": country_ids},
+            Y
+        ))
+
 
         if shuffle:
             ds = ds.shuffle(min(len(df), 10000), seed=42, reshuffle_each_iteration=False)
