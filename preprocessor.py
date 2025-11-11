@@ -24,6 +24,7 @@ class Preprocessor:
         data_dir: str = "data/processed",
         feature_cols: Optional[List[str]] = None,
         target_cols: Optional[List[str]] = None,
+        num_cols: Optional[List[str]] = None,
     ):
         self.lag = lag
         self.lead = lead
@@ -35,10 +36,12 @@ class Preprocessor:
 
         self.feature_cols: List[str] = list(feature_cols) if feature_cols else []
         self.target_cols: List[str] = list(target_cols) if target_cols else []
-
         self.norm_objects = {}
         self.encod_objects = {}
         self.df_base = pd.DataFrame()
+        # Colunas numéricas/bool configuráveis (podem ser definidas externamente).
+        # Se não fornecidas, serão detectadas dinamicamente na primeira normalização.
+        self.num_cols: Optional[List[str]] = list(num_cols) if num_cols else None
 
     def _expand_steps(self, steps, default_max: Optional[int]) -> List[int]:
         """Normaliza passos: int→[1..N], None→[1..default_max], lista→como está."""
@@ -50,7 +53,7 @@ class Preprocessor:
             return list(steps)
         return [1]
 
-    def load_data(self, raw_dir: Optional[str] = None) -> pd.DataFrame:
+    def load_data(self, raw_dir: Optional[str] = None, size: float = 1.0) -> pd.DataFrame:
         """Carrega Parquet unificado em data/raw (ou raw_dir) e atualiza self.df_base."""
         base_raw = raw_dir or os.path.join('data', 'raw')
         unified_path = os.path.join(base_raw, f'raw_dataset.parquet')
@@ -64,6 +67,20 @@ class Preprocessor:
         sort_cols = [c for c in ['country', 'datetime'] if c in df.columns]
         if sort_cols:
             df = df.sort_values(sort_cols).reset_index(drop=True)
+        if 0.0 < size < 1.0:
+            partition_col = 'country' if 'country' in df.columns else None
+            if partition_col:
+                df = (
+                    df.groupby(partition_col, group_keys=False)
+                    .apply(lambda g: g.sample(frac=size, random_state=42))
+                    .reset_index(drop=True)
+                )
+                print(f"[INFO] Carregado {len(df):,} linhas ({size*100:.1f}%) "
+                    f"de {unified_path} [balanceado por '{partition_col}']")
+            else:
+                n_rows = int(len(df) * size)
+                df = df.iloc[:n_rows].copy()
+                print(f"[INFO] Carregado {n_rows:,} linhas ({size*100:.1f}%) de {unified_path}")
             
         # Filtrando Colunas apenas para as necessárias
         cols = list(set([c for c in self.feature_cols + self.target_cols if c in df.columns]))
@@ -192,19 +209,20 @@ class Preprocessor:
         self.df_base = df
         return self.df_base
 
-    def normalize(self, value_cols: List[str], normalization_method: str = 'minmax', train: bool = False) -> pd.DataFrame:
-        """Normaliza colunas e atualiza self.df_base.
+    def normalize(self, normalization_method: str = 'minmax', train: bool = False) -> pd.DataFrame:
+        """Normaliza colunas numéricas/bool e atualiza self.df_base.
 
-        Args:
-            value_cols (list[str]): colunas a normalizar.
-            normalization_method (str): 'minmax' ou 'standard'.
-            train (bool): se True, ajusta o scaler (fit); se False, apenas aplica (transform).
+        - Usa self.num_cols se definida; caso contrário detecta automaticamente.
+        - Ajusta scaler apenas em modo train para evitar leakage.
         """
         if self.df_base is None or self.df_base.empty:
             print("⚠️ df_base vazio. Chame load_data() primeiro.")
             return self.df_base
 
         df = self.df_base.copy()
+
+        # Determina colunas numéricas
+        cols = self.num_cols
 
         # Escolha do scaler
         if normalization_method == 'minmax':
@@ -221,22 +239,25 @@ class Preprocessor:
         # Se já existe um scaler e estamos em modo de uso (não treino)
         if not train and normalization_method in self.norm_objects:
             scaler = self.norm_objects[normalization_method]['scaler']
-            df[value_cols] = scaler.transform(df[value_cols])
+            df[cols] = scaler.transform(df[cols])
 
         # Caso contrário: cria e ajusta novo scaler
         else:
             scaler = scaler_class()
-            df[value_cols] = scaler.fit_transform(df[value_cols])
-            # salva para reutilização futura
+            df[cols] = scaler.fit_transform(df[cols])
             self.norm_objects[normalization_method] = {
-                'value_cols': value_cols,
+                'num_cols': cols,
                 'scaler': scaler
             }
 
         self.df_base = df
         return self.df_base
-    def normalize_splits(self, value_cols: List[str], normalization_method: str = 'minmax', train: bool = False) -> dict:
-        """Normaliza os conjuntos de treino, validação e teste."""
+    def normalize_splits(self, normalization_method: str = 'minmax', train: bool = False) -> dict:
+        """Normaliza os conjuntos de treino, validação e teste usando self.num_cols.
+
+        - Detecta colunas numéricas na primeira chamada se self.num_cols estiver vazia.
+        - Ajusta scaler apenas no split 'train' quando train=True.
+        """
         if not self.splits:
             print("Nenhum conjunto dividido encontrado.")
             return {}
@@ -247,7 +268,7 @@ class Preprocessor:
                 train = True
             else:
                 train = False
-            normalized_df = self.normalize(value_cols=value_cols, normalization_method=normalization_method, train=train)
+            normalized_df = self.normalize(normalization_method=normalization_method, train=train)
             normalized_splits[split_name] = normalized_df
         self.splits = normalized_splits
         return normalized_splits
@@ -261,7 +282,7 @@ class Preprocessor:
         if not info:
             print(f"Nenhum scaler salvo para o método '{normalization_method}'.")
             return self.df_base
-        cols: List[str] = info['value_cols']
+        cols: List[str] = info['num_cols']
         scaler = info['scaler']
         df = self.df_base.copy()
         try:
@@ -348,7 +369,6 @@ class LinearPreprocessor(Preprocessor):
 
     def build_flat_matrix(
         self,
-        value_cols: Optional[List[str]] = None,
         lags: Optional[int] = None,
         leads: Optional[int] = None,
         seq_len: Optional[int] = None,
@@ -365,8 +385,9 @@ class LinearPreprocessor(Preprocessor):
             return self.df_base
 
         df = self.df_base.copy()
-        feats = value_cols or self.feature_cols
-        tgts = self.target_cols
+        # features e targes numéricas -> self.num_cols
+        feats = [c for c in self.feature_cols if c in self.num_cols]
+        tgts = [c for c in self.target_cols if c in self.num_cols]
         if not feats:
             raise ValueError("Nenhuma coluna de feature informada.")
         if not tgts:
@@ -386,15 +407,15 @@ class LinearPreprocessor(Preprocessor):
             df["_group_id"] = "global"
 
         # Apenas colunas numéricas/bool para a construção (não altera self.feature_cols/self.target_cols)
-        num_cols = df.select_dtypes(include=["number", "bool"]).columns.tolist()
-        drop_feats = [c for c in feats if c not in num_cols]
-        drop_tgts = [c for c in tgts if c not in num_cols]
+        numeric_cols = df.select_dtypes(include=["number", "bool"]).columns.tolist()
+        drop_feats = [c for c in feats if c not in numeric_cols]
+        drop_tgts = [c for c in tgts if c not in numeric_cols]
         if drop_feats:
             print(f"[INFO] Ignorando features não numéricas/bool em build_flat_matrix: {drop_feats}")
         if drop_tgts:
             print(f"[INFO] Ignorando targets não numéricos/bool em build_flat_matrix: {drop_tgts}")
-        feats = [c for c in feats if c in num_cols]
-        tgts = [c for c in tgts if c in num_cols]
+        feats = [c for c in feats if c in numeric_cols]
+        tgts = [c for c in tgts if c in numeric_cols]
         if not feats:
             raise ValueError("Nenhuma feature numérica/bool disponível para build_flat_matrix.")
         if not tgts:
@@ -448,6 +469,8 @@ class LinearPreprocessor(Preprocessor):
         self.df_base = df
         self.feature_cols.extend([c for c in new_cols if "_lag" in c and c not in self.feature_cols])
         self.target_cols.extend([c for c in new_cols if "_lead" in c and c not in self.target_cols])
+        self.num_cols.extend([c for c in new_cols if "_lag" in c and c not in self.num_cols])
+        self.num_cols.extend([c for c in new_cols if "_lead" in c and c not in self.num_cols])
 
         return self.df_base
 
