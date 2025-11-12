@@ -53,7 +53,7 @@ class Preprocessor:
             return list(steps)
         return [1]
 
-    def load_data(self, raw_dir: Optional[str] = None, size: float = 1.0) -> pd.DataFrame:
+    def load_data(self, raw_dir: Optional[str] = None, size: float = 1.0, noise: bool = False) -> pd.DataFrame:
         """Carrega Parquet unificado em data/raw (ou raw_dir) e atualiza self.df_base."""
         base_raw = raw_dir or os.path.join('data', 'raw')
         unified_path = os.path.join(base_raw, f'raw_dataset.parquet')
@@ -86,6 +86,20 @@ class Preprocessor:
         cols = list(set([c for c in self.feature_cols + self.target_cols if c in df.columns]))
         df = df.loc[:, ~df.columns.duplicated()]  # optional: remove duplicates
         df = df[cols]
+
+        if noise:
+            numeric_cols = self.num_cols.copy()
+            noise_level = 0.01  # 1% noise
+            for col in numeric_cols:
+                if col in df.columns:
+                    # Adiciona ruído gaussiano
+                    col_std = df[col].std()
+                    noise_values = np.random.normal(0, noise_level * col_std, size=len(df))
+                    df[f"{col}_noise"] = df[col] + noise_values
+                    # Atualiza feature_cols e num_cols
+                    self.feature_cols.remove(col)
+                    self.feature_cols.append(f"{col}_noise")
+                    self.num_cols.append(f"{col}_noise")
 
         self.df_base = df
         return self.df_base
@@ -239,7 +253,18 @@ class Preprocessor:
         # Se já existe um scaler e estamos em modo de uso (não treino)
         if not train and normalization_method in self.norm_objects:
             scaler = self.norm_objects[normalization_method]['scaler']
-            df[cols] = scaler.transform(df[cols])
+            # Removendo _noise das colunas a serem normalizadas
+            true_cols = [c for c in cols if not c.endswith("_noise")]
+            noise_cols = [c for c in cols if c.endswith("_noise")]
+            df[true_cols] = scaler.transform(df[true_cols])
+
+            # fazendo normalização manual para colunas com _noise baseado na métricas do scaler
+            for col in noise_cols:
+                base_col = col.replace("_noise", "")
+                if base_col in self.norm_objects[normalization_method]['num_cols']:
+                    mean = scaler.mean_[self.norm_objects[normalization_method]['num_cols'].index(base_col)]
+                    scale = scaler.scale_[self.norm_objects[normalization_method]['num_cols'].index(base_col)]
+                    df[col] = (df[col] - mean) / scale
 
         # Caso contrário: cria e ajusta novo scaler
         else:
@@ -441,12 +466,14 @@ class LinearPreprocessor(Preprocessor):
                 continue
             # Lags ativos
             for k in active_lags:
-                cname = f"{col}_lag{k}"
+                # remove _noise from column name for lag naming
+                col_name = col.replace("_noise", "")
+                cname = f"{col_name}_lag{k}"
                 df[cname] = df.groupby("_group_id", group_keys=False, sort=False)[col].shift(k)
                 new_cols.append(cname)
             # Lags mascarados (padding)
             for k in padded_lags:
-                cname = f"{col}_lag{k}"
+                cname = f"{col_name}_lag{k}"
                 df[cname] = mask_value
                 new_cols.append(cname)
 
@@ -460,6 +487,21 @@ class LinearPreprocessor(Preprocessor):
             else:
                 print(f"[WARN] Target '{tgt}' não encontrado. Ignorando leads.")
 
+        # Remove colunas noise adicionadas anteriormente
+        noise_remove_cols = [c for c in self.num_cols if "_noise" in c]
+        self.num_cols = [c for c in self.num_cols if c not in noise_remove_cols]
+        
+        # Renomeando coluna sem noise pela com noise
+        for col in feats:
+            tmp = col.endswith("_noise")
+            if tmp:
+                base_col = col.replace("_noise", "")
+                if base_col in df.columns:
+                    self.feature_cols.append(base_col)
+                    self.feature_cols.remove(col)
+                    df[base_col] = df[col]
+                    df.drop(columns=[col], inplace=True)
+
         # ---- Drop NA ----
         df.dropna(subset=new_cols, inplace=True) if dropna else None
 
@@ -467,10 +509,11 @@ class LinearPreprocessor(Preprocessor):
 
         # Atualiza atributos
         self.df_base = df
-        self.feature_cols.extend([c for c in new_cols if "_lag" in c and c not in self.feature_cols])
-        self.target_cols.extend([c for c in new_cols if "_lead" in c and c not in self.target_cols])
-        self.num_cols.extend([c for c in new_cols if "_lag" in c and c not in self.num_cols])
-        self.num_cols.extend([c for c in new_cols if "_lead" in c and c not in self.num_cols])
+        self.feature_cols_real = self.feature_cols.copy()
+        self.target_cols_real = self.target_cols.copy()
+        self.feature_cols_real.extend([c for c in new_cols if "_lag" in c and c not in self.feature_cols])
+        self.feature_cols_real.extend(self.num_cols)  # mantém colunas numéricas originais
+        self.target_cols_real.extend([c for c in new_cols if "_lead" in c and c not in self.target_cols])
 
         return self.df_base
 
@@ -511,8 +554,8 @@ class LinearPreprocessor(Preprocessor):
         for split_name, df in (getattr(self, 'splits', {}) or {}).items():
             path = os.path.join(self.data_dir, f"{basename}_{split_name}.parquet")
             num_cols = df.select_dtypes(include=["number", "bool"]).columns.tolist()
-            fraw = [c for c in self.feature_cols if c in num_cols]
-            traw = [c for c in self.target_cols if c in num_cols]
+            fraw = [c for c in self.feature_cols_real if c in num_cols]
+            traw = [c for c in self.target_cols_real if c in num_cols]
             tcols = _uniq(traw)
             fcols = [c for c in _uniq(fraw) if c not in set(tcols)]
             combined_cols = fcols + tcols
@@ -959,9 +1002,8 @@ class TFTPreprocessor(Preprocessor):
             max_prediction_length=self.lead,
             time_varying_known_reals=known_reals,
             time_varying_unknown_reals=self.target_cols,
-            add_relative_time_idx=True,
-            add_target_scales=True,
-            add_encoder_length=True,
+            target_normalizer= None
         )
         print(f"📦 TimeSeriesDataSet ({split_name}) criado com {len(df)} amostras.")
         return ds
+    
